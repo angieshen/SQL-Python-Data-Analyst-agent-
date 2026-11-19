@@ -1,0 +1,13 @@
+# Secrets & environment variables
+.env
+.env.*
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python & macOS artifacts
+__pycache__/
+*.py[cod]
+.DS_Store

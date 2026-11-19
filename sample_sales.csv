@@ -1,0 +1,11 @@
+order_id,order_date,region,plan_tier,revenue_raw,churned
+1001,2026-01-05,North America,Enterprise,"$4,500.00",false
+1002,2026-01-12,north america,Pro,$850.00,false
+1003,01/18/2026,EMEA,Enterprise,"$6,200.50",false
+1004,2026-02-02,EMEA,Starter,$120.00,true
+1005,2026-02-14,APAC,Pro,"$1,100.00",false
+1006,2026-02-25,North America,Enterprise,NULL,true
+1007,2026-03-03,emea,Pro,"$950.00",false
+1008,2026-03-11,APAC,Enterprise,"$5,100.00",false
+1009,2026-03-19,North America,Pro,"$1,250.00",false
+1010,2026-03-28,EMEA,Enterprise,"$7,400.00",false
