@@ -195,10 +195,24 @@ def create_messy_sample_csv(filepath: Path) -> None:
 # 5. Orchestrator
 # ---------------------------------------------------------------------------
 
-async def run_analyst(local_csv: Path, question: str, chart_out: Path) -> None:
+async def run_analyst(local_file: Path, question: str, chart_out: Path) -> None:
     with tempfile.TemporaryDirectory(prefix="analyst_ws_") as tmp_dir:
         workspace = Path(tmp_dir)
-        shutil.copy2(local_csv, workspace / "data.csv")
+        target_csv = workspace / "data.csv"
+
+        suffix = local_file.suffix.lower()
+        if suffix == ".csv":
+            shutil.copy2(local_file, target_csv)
+        elif suffix in {".xlsx", ".xls"}:
+            import pandas as pd
+            print(f"[2/4] Converting {local_file.name} to CSV for DuckDB...", flush=True)
+            pd.read_excel(local_file).to_csv(target_csv, index=False)
+        elif suffix == ".parquet":
+            import pandas as pd
+            pd.read_parquet(local_file).to_csv(target_csv, index=False)
+        else:
+            raise ValueError(f"Unsupported file type: {suffix}. Use .csv, .xlsx, or .parquet.")
+
         print(f"[2/4] Prepared isolated workspace at {workspace}", flush=True)
 
         deps = AnalystDeps(workspace_dir=workspace)
@@ -225,20 +239,46 @@ async def run_analyst(local_csv: Path, question: str, chart_out: Path) -> None:
 
 
 if __name__ == "__main__":
-    sample_file = Path("sample_sales.csv")
-    if not sample_file.exists():
-        create_messy_sample_csv(sample_file)
+    import argparse
 
-    user_prompt = (
-        "Calculate total revenue and churn rate by region. Clean any formatting issues "
-        "in region names, dates, or currency strings, and save a bar chart comparing "
-        "total revenue across regions."
+    parser = argparse.ArgumentParser(
+        description="Self-Correcting SQL & Python Data Analyst Agent"
     )
+    parser.add_argument(
+        "--file",
+        type=Path,
+        default=Path("sample_sales.csv"),
+        help="Path to the input CSV file (defaults to sample_sales.csv).",
+    )
+    parser.add_argument(
+        "--question",
+        type=str,
+        default=(
+            "Calculate total revenue and churn rate by region. Clean any formatting issues "
+            "in region names, dates, or currency strings, and save a bar chart comparing "
+            "total revenue across regions."
+        ),
+        help="Natural-language analytical question to answer.",
+    )
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=Path("output_chart.png"),
+        help="Output path for the generated PNG chart.",
+    )
+
+    args = parser.parse_args()
+
+    # Auto-create sample_sales.csv only if using the default sample file
+    if args.file == Path("sample_sales.csv") and not args.file.exists():
+        create_messy_sample_csv(args.file)
+    elif not args.file.exists():
+        raise FileNotFoundError(f"Input file not found: {args.file.resolve()}")
 
     asyncio.run(
         run_analyst(
-            local_csv=sample_file,
-            question=user_prompt,
-            chart_out=Path("revenue_by_region.png"),
+            local_file=args.file,
+            question=args.question,
+            chart_out=args.out,
         )
     )
