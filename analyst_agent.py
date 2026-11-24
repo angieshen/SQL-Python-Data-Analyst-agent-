@@ -3,6 +3,7 @@ os.environ["PYDANTIC_AI_NO_BANNER"] = "1"
 
 print("[1/4] Script started...", flush=True)
 
+import argparse
 import asyncio
 import shutil
 import subprocess
@@ -10,20 +11,12 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+import textwrap
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
-
-from google.genai import Client
-from google.genai.types import HttpOptions, HttpRetryOptions
 from pydantic import BaseModel, Field
-from pydantic_ai import Agent, ModelRetry, RunContext
-from pydantic_ai.models.fallback import FallbackModel
-from pydantic_ai.models.google import GoogleModel
-from pydantic_ai.providers.google import GoogleProvider
+from pydantic_ai import Agent, ModelRetry, RunContext, ToolOutput
+from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.providers.ollama import OllamaProvider
 
 
 # ---------------------------------------------------------------------------
@@ -53,42 +46,118 @@ class AnalysisReport(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# 2. Fast-Failover Gemini Client (Prevents 60s 503 Hangs)
+# 2. Local Ollama Agent Factory (No API Key Required)
 # ---------------------------------------------------------------------------
 
-fast_client = Client(
-    http_options=HttpOptions(
-        timeout=15_000,  # 15-second timeout per LLM call
-        retry_options=HttpRetryOptions(attempts=1),  # Fail over immediately on 503
+DEFAULT_LOCAL_MODEL = "qwen3:8b"
+OLLAMA_BASE_URL = "http://localhost:11434/v1"
+
+SYSTEM_PROMPT = (
+    "You are an expert Staff Data Analyst operating inside an isolated local workspace directory.\n"
+    "Follow this strict workflow for every request:\n"
+    "1. SCHEMA PROBE FIRST: Call `inspect_dataset` before writing analytical queries.\n"
+    "2. RUN SQL + CHART VIA `execute_analysis_code`:\n"
+    "   - Pass pure DuckDB SQL in `sql_query` querying `'data.csv'`.\n"
+    "   - Always use `TRY_CAST(...)` (never `CAST(...)`) when parsing messy currency/numeric strings "
+    "(e.g., `TRY_CAST(REGEXP_REPLACE(revenue_raw, '[$,]', '', 'g') AS DOUBLE)`), so `'NULL'` or `''` safely returns `NULL`.\n"
+    "   - Pass short Matplotlib code in `plot_code` using the pre-loaded pandas DataFrame `df` to save `'chart.png'` "
+    "(dpi=150, bbox_inches='tight'). Do not call `plt.show()` and do not use triple-quoted strings.\n"
+)
+
+
+def build_agent(model_name: str = DEFAULT_LOCAL_MODEL, base_url: str = OLLAMA_BASE_URL) -> Agent[AnalystDeps, AnalysisReport]:
+    local_model = OpenAIChatModel(
+        model_name=model_name,
+        provider=OllamaProvider(base_url=base_url),
     )
-)
-google_provider = GoogleProvider(client=fast_client)
 
-resilient_model = FallbackModel(
-    GoogleModel("gemini-3.5-flash-lite", provider=google_provider),
-    GoogleModel("gemini-3.8-flash", provider=google_provider),
-)
+    agent = Agent(
+        local_model,
+        deps_type=AnalystDeps,
+        output_type=ToolOutput(AnalysisReport),
+        retries=8,
+        system_prompt=SYSTEM_PROMPT,
+    )
 
-analyst_agent = Agent(
-    resilient_model,
-    deps_type=AnalystDeps,
-    output_type=AnalysisReport,
-    retries=4,
-    system_prompt=(
-        "You are an expert Staff Data Analyst operating inside an isolated local workspace directory.\n"
-        "Follow this strict workflow for every request:\n"
-        "1. SCHEMA PROBE FIRST: Call `inspect_dataset` before writing analytical queries.\n"
-        "2. USE DUCKDB FOR SQL: Query `'data.csv'` via `duckdb.sql(\"SELECT ... FROM 'data.csv'\")`. "
-        "Important: In this DuckDB version, relations do NOT have `.fetchone()`—always use `.fetchall()` or `.df()`.\n"
-        "3. GENERATE CHARTS: Save matplotlib figures to `'chart.png'` in the current working directory "
-        "(dpi=150, bbox_inches='tight'). Do not call `plt.show()`.\n"
-        "4. VERIFY OUTPUTS: Always `print()` concise summary tables. Never print more than 30 rows."
-    ),
-)
+    @agent.tool
+    def inspect_dataset(ctx: RunContext[AnalystDeps]) -> str:
+        """Probes data.csv using DuckDB to inspect schema, row count, and sample rows."""
+        print("[Tool] Probing dataset schema in DuckDB...", flush=True)
+        probe_code = f"""
+import duckdb
+
+path = "{ctx.deps.data_filename}"
+row_count = duckdb.sql(f"SELECT COUNT(*) FROM '{{path}}'").fetchall()[0][0]
+schema_df = duckdb.sql(f"DESCRIBE SELECT * FROM '{{path}}'").df()
+sample_df = duckdb.sql(f"SELECT * FROM '{{path}}' LIMIT 5").df()
+
+print(f"TOTAL ROWS: {{row_count}}\\n")
+print("=== SCHEMA ===")
+print(schema_df.to_string(index=False))
+print("\\n=== SAMPLE ROWS ===")
+print(sample_df.to_string(index=False))
+"""
+        try:
+            proc = run_in_workspace(probe_code, ctx.deps.workspace_dir)
+        except subprocess.TimeoutExpired:
+            raise ModelRetry("Schema inspection timed out after 30 seconds.")
+
+        if proc.returncode != 0:
+            print(f"[Schema Probe Error] {proc.stderr.strip()}", flush=True)
+            raise ModelRetry(f"Schema inspection failed:\n{proc.stderr}")
+
+        print("[Tool] Schema probe finished! Sending schema to local model...", flush=True)
+        return proc.stdout.strip()
+
+    @agent.tool
+    def execute_analysis_code(ctx: RunContext[AnalystDeps], sql_query: str, plot_code: str = "") -> str:
+        """Executes a DuckDB SQL query against data.csv into `df`, prints `df`, and optionally runs `plot_code` to save chart.png."""
+        print("[Tool] Executing DuckDB SQL + Matplotlib locally...", flush=True)
+
+        (ctx.deps.workspace_dir / "_query.sql").write_text(sql_query, encoding="utf-8")
+
+        clean_plot_code = textwrap.dedent(plot_code).strip()
+        runner_script = (
+            "import duckdb\n"
+            "import pandas as pd\n"
+            "import matplotlib.pyplot as plt\n\n"
+            "sql = open('_query.sql', encoding='utf-8').read()\n"
+            "df = duckdb.sql(sql).df()\n"
+            "print(df.head(30).to_string(index=False))\n\n"
+            f"{clean_plot_code}\n"
+        )
+
+        try:
+            proc = run_in_workspace(runner_script, ctx.deps.workspace_dir)
+        except subprocess.TimeoutExpired:
+            raise ModelRetry("Execution timed out after 30 seconds. Optimize your query.")
+
+        if proc.returncode != 0:
+            err_lines = [line for line in proc.stderr.strip().splitlines() if line.strip()]
+            summary_err = err_lines[-1] if err_lines else "Unknown error"
+            print(f"[Self-Correcting] Caught error: {summary_err}", flush=True)
+            raise ModelRetry(
+                f"Execution failed (exit code {proc.returncode}).\n"
+                f"Stderr:\n{proc.stderr}\n"
+                "Fix the SQL or plot_code and try again."
+            )
+
+        stdout = proc.stdout.strip()
+        if len(stdout) > 4000:
+            stdout = stdout[:4000] + "\n...[OUTPUT TRUNCATED AT 4000 CHARS]..."
+
+        print("[Tool] Analysis script succeeded! Formatting final report...", flush=True)
+        return stdout or "Query executed successfully (0 rows returned)."
+
+    return agent
+
+
+# Default agent instance so `from analyst_agent import analyst_agent` in app.py works out of the box
+analyst_agent = build_agent()
 
 
 # ---------------------------------------------------------------------------
-# 3. Local Subprocess Execution Helper & Tools
+# 3. Local Subprocess Execution Helper
 # ---------------------------------------------------------------------------
 
 def run_in_workspace(code: str, cwd: Path, timeout_sec: int = 30) -> subprocess.CompletedProcess:
@@ -106,69 +175,6 @@ def run_in_workspace(code: str, cwd: Path, timeout_sec: int = 30) -> subprocess.
         text=True,
         timeout=timeout_sec,
     )
-
-
-@analyst_agent.tool
-def inspect_dataset(ctx: RunContext[AnalystDeps]) -> str:
-    """Probes data.csv using DuckDB to inspect schema, row count, and sample rows."""
-    print("[Tool] Probing dataset schema in DuckDB...", flush=True)
-    probe_code = f"""
-import duckdb
-
-path = "{ctx.deps.data_filename}"
-row_count = duckdb.sql(f"SELECT COUNT(*) FROM '{{path}}'").fetchall()[0][0]
-schema_df = duckdb.sql(f"DESCRIBE SELECT * FROM '{{path}}'").df()
-sample_df = duckdb.sql(f"SELECT * FROM '{{path}}' LIMIT 5").df()
-
-print(f"TOTAL ROWS: {{row_count}}\\n")
-print("=== SCHEMA ===")
-print(schema_df.to_string(index=False))
-print("\\n=== SAMPLE ROWS ===")
-print(sample_df.to_string(index=False))
-"""
-    try:
-        proc = run_in_workspace(probe_code, ctx.deps.workspace_dir)
-    except subprocess.TimeoutExpired:
-        raise ModelRetry("Schema inspection timed out after 30 seconds.")
-
-    if proc.returncode != 0:
-        print(f"[Schema Probe Error] {proc.stderr.strip()}", flush=True)
-        raise ModelRetry(f"Schema inspection failed:\n{proc.stderr}")
-
-    print("[Tool] Schema probe finished! Sending results to LLM...", flush=True)
-    return proc.stdout.strip()
-
-
-@analyst_agent.tool
-def execute_analysis_code(ctx: RunContext[AnalystDeps], python_code: str) -> str:
-    """Runs Python + DuckDB + Matplotlib code in the local workspace with automatic self-correction."""
-    print("[Tool] Executing analysis code locally...", flush=True)
-    try:
-        proc = run_in_workspace(python_code, ctx.deps.workspace_dir)
-    except subprocess.TimeoutExpired:
-        raise ModelRetry("Execution timed out after 30 seconds. Optimize your query.")
-
-    if proc.returncode != 0:
-        first_err_line = proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else "Unknown error"
-        print(f"[Self-Correcting] Caught error: {first_err_line}", flush=True)
-        raise ModelRetry(
-            f"Code execution failed (exit code {proc.returncode}).\n"
-            f"Stderr:\n{proc.stderr}\n"
-            "Fix the error and try again."
-        )
-
-    stdout = proc.stdout.strip()
-    if not stdout:
-        raise ModelRetry(
-            "Code executed without errors, but stdout was completely empty. "
-            "Add `print()` statements outputting your computed metrics."
-        )
-
-    if len(stdout) > 4000:
-        stdout = stdout[:4000] + "\n...[OUTPUT TRUNCATED AT 4000 CHARS]..."
-
-    print("[Tool] Analysis script succeeded! Formatting final report...", flush=True)
-    return stdout
 
 
 # ---------------------------------------------------------------------------
@@ -195,7 +201,12 @@ def create_messy_sample_csv(filepath: Path) -> None:
 # 5. Orchestrator
 # ---------------------------------------------------------------------------
 
-async def run_analyst(local_file: Path, question: str, chart_out: Path) -> None:
+async def run_analyst(
+    local_file: Path,
+    question: str,
+    chart_out: Path,
+    model_name: str = DEFAULT_LOCAL_MODEL,
+) -> None:
     with tempfile.TemporaryDirectory(prefix="analyst_ws_") as tmp_dir:
         workspace = Path(tmp_dir)
         target_csv = workspace / "data.csv"
@@ -216,9 +227,10 @@ async def run_analyst(local_file: Path, question: str, chart_out: Path) -> None:
         print(f"[2/4] Prepared isolated workspace at {workspace}", flush=True)
 
         deps = AnalystDeps(workspace_dir=workspace)
+        agent = analyst_agent if model_name == DEFAULT_LOCAL_MODEL else build_agent(model_name=model_name)
 
-        print("[3/4] Running Pydantic AI agent loop...", flush=True)
-        result = await analyst_agent.run(question, deps=deps)
+        print(f"[3/4] Running Pydantic AI agent loop via local Ollama ({model_name})...", flush=True)
+        result = await agent.run(question, deps=deps)
         report = result.output
 
         print("[4/4] Analysis complete!\n", flush=True)
@@ -239,16 +251,14 @@ async def run_analyst(local_file: Path, question: str, chart_out: Path) -> None:
 
 
 if __name__ == "__main__":
-    import argparse
-
     parser = argparse.ArgumentParser(
-        description="Self-Correcting SQL & Python Data Analyst Agent"
+        description="100% Local Self-Correcting SQL & Python Data Analyst Agent (Ollama + DuckDB)"
     )
     parser.add_argument(
         "--file",
         type=Path,
         default=Path("sample_sales.csv"),
-        help="Path to the input CSV file (defaults to sample_sales.csv).",
+        help="Path to the input dataset (.csv, .xlsx, or .parquet).",
     )
     parser.add_argument(
         "--question",
@@ -266,10 +276,15 @@ if __name__ == "__main__":
         default=Path("output_chart.png"),
         help="Output path for the generated PNG chart.",
     )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=DEFAULT_LOCAL_MODEL,
+        help=f"Local Ollama model name (default: {DEFAULT_LOCAL_MODEL}).",
+    )
 
     args = parser.parse_args()
 
-    # Auto-create sample_sales.csv only if using the default sample file
     if args.file == Path("sample_sales.csv") and not args.file.exists():
         create_messy_sample_csv(args.file)
     elif not args.file.exists():
@@ -280,5 +295,6 @@ if __name__ == "__main__":
             local_file=args.file,
             question=args.question,
             chart_out=args.out,
+            model_name=args.model,
         )
     )
